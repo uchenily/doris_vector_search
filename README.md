@@ -11,6 +11,14 @@ A Python SDK of Doris Vector Search for performing vector search operations on A
 - Support for various data formats (pandas DataFrame, PyArrow Table, list of dicts)
 - Support data and schema validation
 
+## Installation
+
+Install in local development mode:
+
+```shell
+pip install -e .
+```
+
 ## Basic Usage
 
 ### Creating A Client
@@ -121,4 +129,3 @@ table.add_index(index_options)
 # Drop index
 table.drop_index()
 ```
-
