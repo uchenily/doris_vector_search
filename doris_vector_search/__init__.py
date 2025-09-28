@@ -565,6 +565,20 @@ class DorisSQLCompiler:
 
         return parameterized_condition, params
 
+    def compile_set_session(self, key: str, value: Any) -> Tuple[str, Dict[str, Any]]:
+        """Compile SET SESSION statement with parameters.
+
+        Args:
+            key: The session variable name
+            value: The value to set
+
+        Returns:
+            Tuple of (sql_string, parameters_dict) for prepared statement execution
+        """
+        param_name = "value"
+        sql = f"SET SESSION {key} = :{param_name}"
+        return sql, {param_name: value}
+
 
 class DorisDDLCompiler:
     """Doris-specific DDL compiler for table creation with vector indexes."""
@@ -1216,6 +1230,7 @@ class DorisVectorClient:
         self.session = sessionmaker(bind=self.engine)
 
         self.ddl_compiler = DorisDDLCompiler()
+        self.sql_compiler = DorisSQLCompiler()
 
     def create_table(
         self,
@@ -1668,6 +1683,31 @@ class DorisVectorClient:
         except Exception as e:
             logger.error(f"Failed to drop table '{table_name}': {e}")
             raise
+
+    def with_session(self, key: str, value: Any) -> Self:
+        """Set a session variable in Doris.
+
+        Args:
+            key: The session variable name
+            value: The value to set for the variable
+
+        Returns:
+            Self
+        """
+        sql, params = self.sql_compiler.compile_set_session(key, value)
+        with self.session.begin() as conn:
+            conn.execute(text(sql), params)
+        logger.debug(f"Set session variable {key} = {value}")
+        return self
+
+    def with_sessions(self, variables: Dict[str, Any]):
+        """Set multiple session variables in Doris.
+
+        Args:
+            variables: Dictionary of variable names to values
+        """
+        for key, value in variables.items():
+            self.with_session(key, value)
 
     def close(self):
         """Close the client connection."""
