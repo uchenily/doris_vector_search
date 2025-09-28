@@ -424,7 +424,10 @@ class DorisSQLCompiler:
             where_clause = f"WHERE {' AND '.join(where_parts)}"
 
         # Build ORDER BY
-        order_clause = "ORDER BY distance"
+        if metric_type == "inner_product":
+            order_clause = "ORDER BY distance DESC"
+        else:
+            order_clause = "ORDER BY distance ASC"
 
         # Build LIMIT
         limit_clause = f"LIMIT {limit}" if limit else ""
@@ -512,7 +515,10 @@ class DorisSQLCompiler:
             where_clause = f"WHERE {' AND '.join(where_parts)}"
 
         # Build ORDER BY using the distance alias
-        order_clause = "ORDER BY distance"
+        if metric_type == "inner_product":
+            order_clause = "ORDER BY distance DESC"
+        else:
+            order_clause = "ORDER BY distance ASC"
 
         # Build LIMIT
         limit_clause = ""
