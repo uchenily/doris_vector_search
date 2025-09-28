@@ -456,7 +456,7 @@ class DorisSQLCompiler:
         # Use named placeholder for vector
         vector_param_name = f"param_{param_counter}"
         vector_placeholder = f":{vector_param_name}"
-        params[vector_param_name] = query_vector
+        params[vector_param_name] = str(query_vector)
         param_counter += 1
 
         # Determine which columns to select
@@ -471,7 +471,7 @@ class DorisSQLCompiler:
 
         distance_fn = f"{metric_type}_approximate"
         distance_clause = (
-            f"{distance_fn}(`{vector_column}`, {vector_placeholder}) as distance"
+            f"""{distance_fn}(`{vector_column}`, CAST({vector_placeholder} AS ARRAY<FLOAT>)) AS distance"""
         )
 
         select_clause += f", {distance_clause}"
@@ -781,9 +781,7 @@ class VectorSearchQuery:
 
         # NOTE: Currently, FE has restrictions on prepared sql parameters of type array<float>,
         # so we can not directly use prepared statements for vector params now.
-        # sql, params = compiler.compile_vector_search_query_prepared(
-        params = {}
-        sql = self.compiler.compile_vector_search_query(
+        sql, params = self.compiler.compile_vector_search_query_prepared(
             table_name=self.table.table_name,
             query_vector=self.query_vector,
             vector_column=self.vector_column,
