@@ -13,9 +13,14 @@ A Python SDK of Doris Vector Search for performing vector search operations on A
 
 ## Installation
 
+```shell
+pip install doris-vector-search
+```
+
 Install in local development mode:
 
 ```shell
+git clone https://github.com/uchenily/doris_vector_search && cd doris_vector_search
 pip install -e .
 ```
 
