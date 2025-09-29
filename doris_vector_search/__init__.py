@@ -1300,6 +1300,9 @@ class DorisVectorClient:
         key_column = schema_info.key_column
         vector_column = schema_info.vector_column
 
+        if not key_column:
+            raise ValueError("No suitable key column found in data")
+
         for col_name, col_info in schema_info.columns.items():
             columns[col_name] = col_info["doris_type"]
 
@@ -1315,6 +1318,10 @@ class DorisVectorClient:
                 "dim": schema_info.vector_dim,
             }
 
+        # Determine buckets by counting alive backends
+        num_buckets = self._get_alive_be_count()
+        logger.debug(f"Using {num_buckets} BUCKETS according to alive backends")
+
         # Create TableOptions object
         table_options = TableOptions(
             table_name=table_name,
@@ -1322,7 +1329,7 @@ class DorisVectorClient:
             key_column=key_column,
             vector_column=vector_column if create_index else None,
             vector_options=vector_options,
-            num_buckets=1,  # Default bucket count
+            num_buckets=num_buckets,
         )
 
         # Compile DDL
@@ -1712,6 +1719,33 @@ class DorisVectorClient:
         """
         for key, value in variables.items():
             self.with_session(key, value)
+
+    def _get_alive_be_count(self) -> int:
+        """Get the count of alive backends."""
+        try:
+            with self.session.begin() as conn:
+                result = conn.execute(text("SHOW BACKENDS"))
+                rows = result.fetchall()
+                col_names = list(result.keys())
+                alive_idx = None
+                if col_names:
+                    for i, n in enumerate(col_names):
+                        if str(n).lower() == "alive":
+                            alive_idx = i
+                            break
+                count = 0
+                if alive_idx is None:
+                    # Fallback: assume all rows are backends
+                    count = len(rows)
+                else:
+                    for r in rows:
+                        sval = str(r[alive_idx]).strip().lower()
+                        if sval in ("true", "1", "yes", "y"):
+                            count += 1
+                return max(1, count)
+        except Exception as e:
+            logger.warning(f"SHOW BACKENDS failed, fallback to 1 bucket: {e}")
+            return 1
 
     def close(self):
         """Close the client connection."""
