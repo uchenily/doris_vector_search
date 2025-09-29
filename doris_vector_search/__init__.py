@@ -1236,6 +1236,13 @@ class DorisVectorClient:
         self.ddl_compiler = DorisDDLCompiler()
         self.sql_compiler = DorisSQLCompiler()
 
+        # Set default session variables
+        self.with_sessions({
+            "enable_profile": "false",
+            "parallel_pipeline_task_num": "1",
+            "num_scanner_threads": "1",
+        })
+
     def create_table(
         self,
         table_name: str,
