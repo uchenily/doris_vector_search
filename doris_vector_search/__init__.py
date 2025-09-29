@@ -447,17 +447,16 @@ class DorisSQLCompiler:
         where_conditions: Optional[List[str]] = None,
         selected_columns: Optional[List[str]] = None,
         metric_type: str = "l2_distance",
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> Tuple[str, List[Any]]:
         """Compile vector search query to Doris SQL with prepared statement.
 
         Returns:
-            Tuple of (sql_string, parameters_dict) for prepared statement execution
+            Tuple of (sql_string, parameters_list) for prepared statement execution
         """
-        params = {}
+        params = []
 
-        # Use named placeholder for vector
-        vector_placeholder = ":vector"
-        params["vector"] = str(query_vector)
+        # Use positional placeholder for vector
+        vector_value = str(query_vector)
 
         # Determine which columns to select
         if selected_columns:
@@ -470,9 +469,8 @@ class DorisSQLCompiler:
         select_clause = ", ".join(f"`{col}`" for col in select_columns)
 
         distance_fn = f"{metric_type}_approximate"
-        distance_clause = (
-            f"""{distance_fn}(`{vector_column}`, CAST({vector_placeholder} AS ARRAY<FLOAT>)) AS distance"""
-        )
+        distance_clause = f"""{distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) AS distance"""
+        params.append(vector_value)
 
         select_clause += f", {distance_clause}"
 
@@ -483,26 +481,22 @@ class DorisSQLCompiler:
         if distance_range:
             lower_bound, upper_bound = distance_range
             if lower_bound is not None:
-                where_parts.append(
-                    f"{distance_fn}(`{vector_column}`, {vector_placeholder}) >= :lower"
-                )
-                params["lower"] = lower_bound
+                where_parts.append(f"{distance_fn}(`{vector_column}`, ?) >= ?")
+                params.append(vector_value)
+                params.append(lower_bound)
             if upper_bound is not None:
-                where_parts.append(
-                    f"{distance_fn}(`{vector_column}`, {vector_placeholder}) <= :upper"
-                )
-                params["upper"] = upper_bound
+                where_parts.append(f"{distance_fn}(`{vector_column}`, ?) <= ?")
+                params.append(vector_value)
+                params.append(upper_bound)
 
         # Add user-defined WHERE conditions with parameterization
-        param_counter = len(params)
         if where_conditions:
             for condition in where_conditions:
                 parameterized_condition, condition_params = (
-                    self._parameterize_where_condition(condition, param_counter)
+                    self._parameterize_where_condition(condition, len(params))
                 )
                 where_parts.append(parameterized_condition)
-                params.update(condition_params)
-                param_counter += len(condition_params)
+                params.extend(condition_params)
 
         where_clause = ""
         if where_parts:
@@ -523,7 +517,7 @@ class DorisSQLCompiler:
 
     def _parameterize_where_condition(
         self, condition: str, param_start_index: int
-    ) -> Tuple[str, Dict[str, Any]]:
+    ) -> Tuple[str, List[Any]]:
         """Parameterize a single WHERE condition.
 
         Args:
@@ -531,7 +525,7 @@ class DorisSQLCompiler:
             param_start_index: Starting index for parameter placeholders
 
         Returns:
-            Tuple of (parameterized_condition, parameters_dict)
+            Tuple of (parameterized_condition, parameters_list)
         """
         # Parse the condition: column_name operator value
         parts = condition.split()
@@ -540,23 +534,22 @@ class DorisSQLCompiler:
 
         column_name, operator, value_str = parts
 
-        params = {}
-        param_name = f"param_{param_start_index}"
+        params = []
 
         # Handle different value types
         if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')):
             # Quoted string value
             inner_value = value_str[1:-1]
-            params[param_name] = inner_value
+            params.append(inner_value)
         else:
             # Numeric value
             try:
-                params[param_name] = float(value_str)
+                params.append(float(value_str))
             except ValueError:
                 raise ValueError(f"Invalid numeric value in condition: {condition}")
 
-        # Create parameterized condition with named placeholder
-        parameterized_condition = f"{column_name} {operator} :{param_name}"
+        # Create parameterized condition with positional placeholder
+        parameterized_condition = f"{column_name} {operator} ?"
 
         return parameterized_condition, params
 
@@ -792,10 +785,16 @@ class VectorSearchQuery:
         logger.debug(f'generated sql: "{sql}"')
         logger.debug(f"parameters: {params}")
 
-        # Use SQLAlchemy with mysqlconnector for server-side prepared statements
-        with self.table.client.session.begin() as conn:
-            result = conn.execute(text(sql), params)
-            rows = result.fetchall()
+        # Use mysqlconnector raw connection with prepared cursor for vector search
+        raw_conn_wrapper = self.table.client.engine.raw_connection()
+        try:
+            raw_conn = raw_conn_wrapper.connection
+            cursor = raw_conn.cursor(buffered=False, prepared=True)
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            cursor.close()
+        finally:
+            raw_conn_wrapper.close()
 
         select_columns = self.selected_columns or all_columns
         col_data = {col: [] for col in select_columns}
