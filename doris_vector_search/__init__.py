@@ -803,8 +803,12 @@ class VectorSearchQuery:
             # Raw cursor returns tuples, map to dict by column order
             row_dict = dict(zip(select_columns, row))
 
-            # Parse vector columns from Doris ARRAY<FLOAT> format
+            # Decode bytes/bytearray to str and parse vector columns from Doris ARRAY<FLOAT> format
             for col_name, value in row_dict.items():
+                if isinstance(value, (bytes, bytearray)):
+                    value = value.decode('utf-8')
+                    row_dict[col_name] = value
+
                 if (
                     isinstance(value, str)
                     and value.startswith("[")
