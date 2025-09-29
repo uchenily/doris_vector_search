@@ -1,4 +1,11 @@
 from doris_vector_search import DorisVectorClient
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 # Create client
 db = DorisVectorClient(database="test_database")

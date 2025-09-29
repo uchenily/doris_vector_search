@@ -454,13 +454,10 @@ class DorisSQLCompiler:
             Tuple of (sql_string, parameters_dict) for prepared statement execution
         """
         params = {}
-        param_counter = 0
 
         # Use named placeholder for vector
-        vector_param_name = f"param_{param_counter}"
-        vector_placeholder = f":{vector_param_name}"
-        params[vector_param_name] = str(query_vector)
-        param_counter += 1
+        vector_placeholder = ":vector"
+        params["vector"] = str(query_vector)
 
         # Determine which columns to select
         if selected_columns:
@@ -486,21 +483,18 @@ class DorisSQLCompiler:
         if distance_range:
             lower_bound, upper_bound = distance_range
             if lower_bound is not None:
-                lower_param_name = f"param_{param_counter}"
                 where_parts.append(
-                    f"{distance_fn}(`{vector_column}`, {vector_placeholder}) >= :{lower_param_name}"
+                    f"{distance_fn}(`{vector_column}`, {vector_placeholder}) >= :lower"
                 )
-                params[lower_param_name] = lower_bound
-                param_counter += 1
+                params["lower"] = lower_bound
             if upper_bound is not None:
-                upper_param_name = f"param_{param_counter}"
                 where_parts.append(
-                    f"{distance_fn}(`{vector_column}`, {vector_placeholder}) <= :{upper_param_name}"
+                    f"{distance_fn}(`{vector_column}`, {vector_placeholder}) <= :upper"
                 )
-                params[upper_param_name] = upper_bound
-                param_counter += 1
+                params["upper"] = upper_bound
 
         # Add user-defined WHERE conditions with parameterization
+        param_counter = len(params)
         if where_conditions:
             for condition in where_conditions:
                 parameterized_condition, condition_params = (
@@ -520,25 +514,21 @@ class DorisSQLCompiler:
         else:
             order_clause = "ORDER BY distance ASC"
 
-        # Build LIMIT
-        limit_clause = ""
-        if limit is not None:
-            limit_param_name = f"param_{param_counter}"
-            limit_clause = f"LIMIT :{limit_param_name}"
-            params[limit_param_name] = limit
+        # Build LIMIT (inline, as Doris may not support LIMIT as prepared param)
+        limit_clause = f"LIMIT {limit}" if limit is not None else ""
 
         sql = f"SELECT {select_clause} FROM `{table_name}` {where_clause} {order_clause} {limit_clause}"
 
         return sql, params
 
     def _parameterize_where_condition(
-        self, condition: str, param_counter: int
+        self, condition: str, param_start_index: int
     ) -> Tuple[str, Dict[str, Any]]:
         """Parameterize a single WHERE condition.
 
         Args:
             condition: The WHERE condition string (e.g., "age > 18", "name = 'John'")
-            param_counter: Current parameter counter for generating unique parameter names
+            param_start_index: Starting index for parameter placeholders
 
         Returns:
             Tuple of (parameterized_condition, parameters_dict)
@@ -550,9 +540,8 @@ class DorisSQLCompiler:
 
         column_name, operator, value_str = parts
 
-        # Generate parameter name
-        param_name = f"param_{param_counter}"
         params = {}
+        param_name = f"param_{param_start_index}"
 
         # Handle different value types
         if value_str.startswith(("'", '"')) and value_str.endswith(("'", '"')):
@@ -566,24 +555,26 @@ class DorisSQLCompiler:
             except ValueError:
                 raise ValueError(f"Invalid numeric value in condition: {condition}")
 
-        # Create parameterized condition
-        parameterized_condition = f"`{column_name}` {operator} :{param_name}"
+        # Create parameterized condition with named placeholder
+        parameterized_condition = f"{column_name} {operator} :{param_name}"
 
         return parameterized_condition, params
 
-    def compile_set_session(self, key: str, value: Any) -> Tuple[str, Dict[str, Any]]:
-        """Compile SET SESSION statement with parameters.
+    def compile_set_session(self, key: str, value: Any) -> str:
+        """Compile SET SESSION statement without parameters.
 
         Args:
             key: The session variable name
             value: The value to set
 
         Returns:
-            Tuple of (sql_string, parameters_dict) for prepared statement execution
+            sql_string for execution
         """
-        param_name = "value"
-        sql = f"SET SESSION {key} = :{param_name}"
-        return sql, {param_name: value}
+        if isinstance(value, str):
+            sql = f"SET SESSION {key} = '{value}'"
+        else:
+            sql = f"SET SESSION {key} = {value}"
+        return sql
 
 
 class DorisDDLCompiler:
@@ -801,7 +792,8 @@ class VectorSearchQuery:
         logger.debug(f'generated sql: "{sql}"')
         logger.debug(f"parameters: {params}")
 
-        with self.table.get_session().begin() as conn:
+        # Use SQLAlchemy with mysqlconnector for server-side prepared statements
+        with self.table.client.session.begin() as conn:
             result = conn.execute(text(sql), params)
             rows = result.fetchall()
 
@@ -809,8 +801,8 @@ class VectorSearchQuery:
         col_data = {col: [] for col in select_columns}
 
         for row in rows:
-            # assert(hasattr(row, "_mapping"))
-            row_dict = dict(row._mapping)
+            # Raw cursor returns tuples, map to dict by column order
+            row_dict = dict(zip(select_columns, row))
 
             # Parse vector columns from Doris ARRAY<FLOAT> format
             for col_name, value in row_dict.items():
@@ -1232,9 +1224,8 @@ class DorisVectorClient:
         self.auth_options = auth_options if auth_options else AuthOptions()
         self.load_options = load_options if load_options else LoadOptions()
 
-        # Create SQLAlchemy engine
-        # Or mysql+mysqlconnector?
-        connection_string = f"mysql+pymysql://{self.auth_options.user}:{self.auth_options.password}@{self.auth_options.host}:{self.auth_options.query_port}/{self.database}"
+        # Create SQLAlchemy engine with mysqlconnector for server-side prepared statements
+        connection_string = f"mysql+mysqlconnector://{self.auth_options.user}:{self.auth_options.password}@{self.auth_options.host}:{self.auth_options.query_port}/{self.database}"
         self.engine = create_engine(connection_string, echo=False)
         self.session = sessionmaker(bind=self.engine)
 
@@ -1717,9 +1708,9 @@ class DorisVectorClient:
         Returns:
             Self
         """
-        sql, params = self.sql_compiler.compile_set_session(key, value)
+        sql = self.sql_compiler.compile_set_session(key, value)
         with self.session.begin() as conn:
-            conn.execute(text(sql), params)
+            conn.execute(text(sql))
         logger.debug(f"Set session variable {key} = {value}")
         return self
 

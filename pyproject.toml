@@ -4,8 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "doris-vector-search"
-version = "0.0.1"
+version = "0.0.1.dev1"
 description = "Doris Vector Search Python SDK"
+readme = "README.md"
 dependencies = [
     "sqlalchemy>=1.4.0",
     "pymysql>=1.0.0",
