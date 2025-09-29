@@ -874,6 +874,7 @@ class DorisTable:
         self.column_names: List[str] = [name for name, _ in self.columns]
         self.ddl_compiler = DorisDDLCompiler()
         self.index_options = index_options or IndexOptions()
+        self._vector_column: Optional[str] = None
 
     def get_session(self):
         return self.client.session
@@ -1114,13 +1115,17 @@ class DorisTable:
 
     def _detect_vector_column(self) -> str:
         """Auto-detect the vector column name from table schema."""
+        if self._vector_column is not None:
+            return self._vector_column
+
         # Check for ARRAY columns (vectors)
         for col_name, col_type in self.columns:
             if col_type.upper().startswith("ARRAY"):
                 logger.debug(f"Auto-detected vector column: '{col_name}'")
+                self._vector_column = col_name
                 return col_name
 
-        raise ValueError("No key column")
+        raise ValueError("No vector column")
 
     def _get_vector_dim(self, vector_column: str) -> int:
         """Get the dimension of the vector column."""
