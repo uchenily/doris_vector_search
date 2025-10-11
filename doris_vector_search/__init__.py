@@ -389,16 +389,13 @@ class DorisSQLCompiler:
         if selected_columns:
             select_columns = selected_columns
         else:
-            # Default: select all columns + `distance` column
+            # Default: select all columns
             select_columns = ["*"]
 
         # Build SELECT clause
         select_clause = ", ".join(f"`{col}`" for col in select_columns)
 
         distance_fn = f"{metric_type}_approximate"
-        distance_clause = f"{distance_fn}(`{vector_column}`, {vector_str}) as distance"
-
-        select_clause += f", {distance_clause}"
 
         # Build WHERE clause
         where_parts = []
@@ -425,9 +422,9 @@ class DorisSQLCompiler:
 
         # Build ORDER BY
         if metric_type == "inner_product":
-            order_clause = "ORDER BY distance DESC"
+            order_clause = f"ORDER BY {distance_fn}(`{vector_column}`, {vector_str}) DESC"
         else:
-            order_clause = "ORDER BY distance ASC"
+            order_clause = f"ORDER BY {distance_fn}(`{vector_column}`, {vector_str}) ASC"
 
         # Build LIMIT
         limit_clause = f"LIMIT {limit}" if limit else ""
@@ -462,17 +459,13 @@ class DorisSQLCompiler:
         if selected_columns:
             select_columns = selected_columns
         else:
-            # Default: select all columns + `distance` column
+            # Default: select all columns
             select_columns = ["*"]
 
         # Build SELECT clause
         select_clause = ", ".join(f"`{col}`" for col in select_columns)
 
         distance_fn = f"{metric_type}_approximate"
-        distance_clause = f"""{distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) AS distance"""
-        params.append(vector_value)
-
-        select_clause += f", {distance_clause}"
 
         # Build WHERE clause
         where_parts = []
@@ -481,11 +474,11 @@ class DorisSQLCompiler:
         if distance_range:
             lower_bound, upper_bound = distance_range
             if lower_bound is not None:
-                where_parts.append(f"{distance_fn}(`{vector_column}`, ?) >= ?")
+                where_parts.append(f"{distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) >= ?")
                 params.append(vector_value)
                 params.append(lower_bound)
             if upper_bound is not None:
-                where_parts.append(f"{distance_fn}(`{vector_column}`, ?) <= ?")
+                where_parts.append(f"{distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) <= ?")
                 params.append(vector_value)
                 params.append(upper_bound)
 
@@ -502,11 +495,12 @@ class DorisSQLCompiler:
         if where_parts:
             where_clause = f"WHERE {' AND '.join(where_parts)}"
 
-        # Build ORDER BY using the distance alias
+        # Build ORDER BY using the distance function
         if metric_type == "inner_product":
-            order_clause = "ORDER BY distance DESC"
+            order_clause = f"ORDER BY {distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) DESC"
         else:
-            order_clause = "ORDER BY distance ASC"
+            order_clause = f"ORDER BY {distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) ASC"
+        params.append(vector_value)
 
         # Build LIMIT (inline, as Doris may not support LIMIT as prepared param)
         limit_clause = f"LIMIT {limit}" if limit is not None else ""
@@ -769,8 +763,6 @@ class VectorSearchQuery:
         ):
             distance_range = (self.distance_range_lower, self.distance_range_upper)
 
-        # NOTE: Currently, FE has restrictions on prepared sql parameters of type array<float>,
-        # so we can not directly use prepared statements for vector params now.
         sql, params = self.compiler.compile_vector_search_query_prepared(
             table_name=self.table.table_name,
             query_vector=self.query_vector,
@@ -796,6 +788,7 @@ class VectorSearchQuery:
         select_columns = self.selected_columns or all_columns
         col_data = {col: [] for col in select_columns}
 
+        # TODO: optimize it
         for row in rows:
             # Raw cursor returns tuples, map to dict by column order
             row_dict = dict(zip(select_columns, row))
