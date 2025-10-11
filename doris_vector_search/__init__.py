@@ -4,6 +4,7 @@ import concurrent.futures
 import io
 import logging
 import math
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterable, List, Optional, Self, Tuple, Union
 
@@ -1130,6 +1131,15 @@ class DorisTable:
         if self.index_options.dim != -1:
             return self.index_options.dim
 
+        # Try to get dim from table metadata first
+        try:
+            dim = self._get_dim_from_table_metadata(vector_column)
+            if dim != -1:
+                self.index_options.dim = dim
+                return self.index_options.dim
+        except Exception as e:
+            logger.warning(f"Failed to get vector dimension from metadata: {e}")
+
         try:
             # Sample a row to get vector dimension
             with self.client.session.begin() as conn:
@@ -1148,6 +1158,27 @@ class DorisTable:
         except Exception as e:
             logger.warning(f"Failed to get vector dimension: {e}")
         raise ValueError("Failed to get vector dimension")
+
+    def _get_dim_from_table_metadata(self, vector_column: str) -> int:
+        """Get dimension from table's CREATE TABLE statement."""
+        try:
+            with self.client.session.begin() as conn:
+                result = conn.execute(text(f"SHOW CREATE TABLE `{self.table_name}`"))
+                row = result.fetchone()
+                if row:
+                    create_table_sql = row[-1]
+                    # Parse the PROPERTIES in the INDEX clause
+                    # Looking for: USING ANN PROPERTIES("dim" = "xxx", ...)
+                    match = re.search(r'USING\s+ANN\s+PROPERTIES\s*\((.*?)\)', create_table_sql, re.IGNORECASE)
+                    if match:
+                        properties_str = match.group(1)
+                        # Find "dim" = "xxx"
+                        dim_match = re.search(r'"dim"\s*=\s*"(\d+)"', properties_str)
+                        if dim_match:
+                            return int(dim_match.group(1))
+        except Exception as e:
+            logger.warning(f"Failed to parse dim from CREATE TABLE: {e}")
+        return -1
 
     def add_index(self, options: IndexOptions):
         """Create and build a vector index on the table.
