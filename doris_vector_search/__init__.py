@@ -12,8 +12,7 @@ import pandas as pd
 import pyarrow as pa
 import requests
 from requests.auth import HTTPBasicAuth
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import sessionmaker
+import mysql.connector
 
 # All supported data types for create_table/add
 Block = Union[List[dict], pd.DataFrame, pa.Table, Iterable[pa.RecordBatch]]
@@ -786,16 +785,13 @@ class VectorSearchQuery:
         logger.debug(f'generated sql: "{sql}"')
         logger.debug(f"parameters: {params}")
 
-        # Use mysqlconnector raw connection with prepared cursor for vector search
-        raw_conn_wrapper = self.table.client.engine.raw_connection()
+        # Use mysqlconnector connection with prepared cursor for vector search
+        cursor = self.table.client.connection.cursor(buffered=False, prepared=True)
         try:
-            raw_conn = raw_conn_wrapper.connection
-            cursor = raw_conn.cursor(buffered=False, prepared=True)
             cursor.execute(sql, params)
             rows = cursor.fetchall()
-            cursor.close()
         finally:
-            raw_conn_wrapper.close()
+            cursor.close()
 
         select_columns = self.selected_columns or all_columns
         col_data = {col: [] for col in select_columns}
@@ -873,7 +869,7 @@ class DorisTable:
         self._vector_column: Optional[str] = None
 
     def get_session(self):
-        return self.client.session
+        return self.client.connection
 
     def schema(self):
         return self.columns
@@ -881,15 +877,17 @@ class DorisTable:
     def _get_columns(self) -> List[Tuple[str, str]]:
         """Get column names and types from Doris."""
         try:
-            with self.client.session.begin() as conn:
-                # | Field | Type | Null | Key | Default | Extra |
-                result = conn.execute(text(f"DESCRIBE {self.table_name}"))
+            cursor = self.client.connection.cursor()
+            try:
+                cursor.execute(f"DESCRIBE {self.table_name}")
                 columns = []
-                for row in result.fetchall():
+                for row in cursor.fetchall():
                     col_name = str(row[0])  # Field name
                     col_type = str(row[1])  # Type
                     columns.append((col_name, col_type))
                 return columns
+            finally:
+                cursor.close()
         except Exception as e:
             logger.warning(f"Failed to get columns for table {self.table_name}: {e}")
             raise e
@@ -979,11 +977,12 @@ class DorisTable:
     def _get_table_schema(self) -> Dict[str, Dict[str, Any]]:
         """Get the table schema from Doris."""
         try:
-            with self.client.session.begin() as conn:
-                result = conn.execute(text(f"DESCRIBE {self.table_name}"))
+            cursor = self.client.connection.cursor()
+            try:
+                cursor.execute(f"DESCRIBE {self.table_name}")
                 schema = {}
 
-                for row in result.fetchall():
+                for row in cursor.fetchall():
                     # Field | Type | Null | Key | Default | Extra
                     col_name, col_type, is_null, key, default, extra = row
                     schema[col_name] = {
@@ -994,6 +993,8 @@ class DorisTable:
                     }
 
                 return schema
+            finally:
+                cursor.close()
 
         except Exception as e:
             logger.error(f"Failed to get schema for table {self.table_name}: {e}")
@@ -1142,11 +1143,10 @@ class DorisTable:
 
         try:
             # Sample a row to get vector dimension
-            with self.client.session.begin() as conn:
-                result = conn.execute(
-                    text(f"SELECT `{vector_column}` FROM `{self.table_name}` LIMIT 1")
-                )
-                row = result.fetchone()
+            cursor = self.client.connection.cursor()
+            try:
+                cursor.execute(f"SELECT `{vector_column}` FROM `{self.table_name}` LIMIT 1")
+                row = cursor.fetchone()
                 if row and row[0]:
                     # Parse the vector string format like: [1.0,2.0,3.0]
                     vector_str = str(row[0])
@@ -1155,6 +1155,8 @@ class DorisTable:
                         # Udpate index_options.dim
                         self.index_options.dim = len(vec_list)
                         return self.index_options.dim
+            finally:
+                cursor.close()
         except Exception as e:
             logger.warning(f"Failed to get vector dimension: {e}")
         raise ValueError("Failed to get vector dimension")
@@ -1162,11 +1164,15 @@ class DorisTable:
     def _get_dim_from_table_metadata(self, vector_column: str) -> int:
         """Get dimension from table's CREATE TABLE statement."""
         try:
-            with self.client.session.begin() as conn:
-                result = conn.execute(text(f"SHOW CREATE TABLE `{self.table_name}`"))
-                row = result.fetchone()
+            cursor = self.client.connection.cursor()
+            try:
+                cursor.execute(f"SHOW CREATE TABLE `{self.table_name}`")
+                row = cursor.fetchone()
                 if row:
                     create_table_sql = row[-1]
+                    # Handle bytes to string conversion
+                    if isinstance(create_table_sql, bytes):
+                        create_table_sql = create_table_sql.decode('utf-8')
                     # Parse the PROPERTIES in the INDEX clause
                     # Looking for: USING ANN PROPERTIES("dim" = "xxx", ...)
                     match = re.search(r'USING\s+ANN\s+PROPERTIES\s*\((.*?)\)', create_table_sql, re.IGNORECASE)
@@ -1176,6 +1182,8 @@ class DorisTable:
                         dim_match = re.search(r'"dim"\s*=\s*"(\d+)"', properties_str)
                         if dim_match:
                             return int(dim_match.group(1))
+            finally:
+                cursor.close()
         except Exception as e:
             logger.warning(f"Failed to parse dim from CREATE TABLE: {e}")
         return -1
@@ -1205,17 +1213,20 @@ class DorisTable:
         )
 
         try:
-            with self.client.session.begin() as conn:
+            cursor = self.client.connection.cursor()
+            try:
                 # Create index
                 logger.debug(f"Creating index with SQL: {create_sql}")
-                conn.execute(text(create_sql))
-                conn.commit()
+                cursor.execute(create_sql)
+                self.client.connection.commit()
                 logger.debug(f"Successfully created index idx_{vector_column}")
 
                 # Build index
-                conn.execute(text(build_sql))
+                cursor.execute(build_sql)
                 logger.debug(f"Building index with SQL: {build_sql}")
-                conn.commit()
+                self.client.connection.commit()
+            finally:
+                cursor.close()
             logger.debug(f"Successfully built index idx_{vector_column}")
 
         except Exception as e:
@@ -1236,9 +1247,13 @@ class DorisTable:
         logger.debug(f"Dropping index with SQL: {drop_sql}")
 
         try:
-            with self.client.session.begin() as conn:
-                conn.execute(text(drop_sql))
+            cursor = self.client.connection.cursor()
+            try:
+                cursor.execute(drop_sql)
+                self.client.connection.commit()
                 logger.debug(f"Successfully dropped index idx_{vector_column}")
+            finally:
+                cursor.close()
 
         except Exception as e:
             logger.error(f"Failed to drop index idx_{vector_column}: {e}")
@@ -1258,10 +1273,14 @@ class DorisVectorClient:
         self.auth_options = auth_options if auth_options else AuthOptions()
         self.load_options = load_options if load_options else LoadOptions()
 
-        # Create SQLAlchemy engine with mysqlconnector for server-side prepared statements
-        connection_string = f"mysql+mysqlconnector://{self.auth_options.user}:{self.auth_options.password}@{self.auth_options.host}:{self.auth_options.query_port}/{self.database}"
-        self.engine = create_engine(connection_string, echo=False)
-        self.session = sessionmaker(bind=self.engine)
+        # Create direct mysql.connector connection
+        self.connection = mysql.connector.connect(
+            host=self.auth_options.host,
+            port=self.auth_options.query_port,
+            user=self.auth_options.user,
+            password=self.auth_options.password,
+            database=self.database
+        )
 
         self.ddl_compiler = DorisDDLCompiler()
         self.sql_compiler = DorisSQLCompiler()
@@ -1311,18 +1330,22 @@ class DorisVectorClient:
 
         # Check if table already exists
         try:
-            inspector = inspect(self.engine)
-            if inspector.has_table(table_name):
-                if overwrite:
-                    logger.debug(
-                        f"Table '{table_name}' already exists. Dropping it as requested."
-                    )
-                    self.drop_table(table_name)
-                else:
-                    logger.debug(
-                        f"Table '{table_name}' already exists. Skipping creation."
-                    )
-                    return DorisTable(table_name, self)
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+                if cursor.fetchone():
+                    if overwrite:
+                        logger.debug(
+                            f"Table '{table_name}' already exists. Dropping it as requested."
+                        )
+                        self.drop_table(table_name)
+                    else:
+                        logger.debug(
+                            f"Table '{table_name}' already exists. Skipping creation."
+                        )
+                        return DorisTable(table_name, self)
+            finally:
+                cursor.close()
         except Exception as e:
             if "detailMessage = Unknown table" in f"{e}":
                 pass
@@ -1375,14 +1398,17 @@ class DorisVectorClient:
         logger.debug(f"Creating table with DDL: {ddl}")
 
         # Execute DDL
-        with self.session.begin() as conn:
-            conn.execute(text(ddl))
-            # conn.commit()
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(ddl)
+            self.connection.commit()
 
             # Insert data using stream load
             self._insert_data_stream_load(
                 table_name, arrow_table, schema_info, load_options
             )
+        finally:
+            cursor.close()
 
         return DorisTable(table_name, self)
 
@@ -1725,8 +1751,12 @@ class DorisVectorClient:
 
             logger.debug(f"Executing SQL: {drop_sql}")
 
-            with self.session.begin() as conn:
-                conn.execute(text(drop_sql))
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute(drop_sql)
+                self.connection.commit()
+            finally:
+                cursor.close()
             logger.debug(f"Successfully dropped table '{table_name}'")
         except Exception as e:
             logger.error(f"Failed to drop table '{table_name}': {e}")
@@ -1743,8 +1773,12 @@ class DorisVectorClient:
             Self
         """
         sql = self.sql_compiler.compile_set_session(key, value)
-        with self.session.begin() as conn:
-            conn.execute(text(sql))
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(sql)
+            self.connection.commit()
+        finally:
+            cursor.close()
         logger.debug(f"Set session variable {key} = {value}")
         return self
 
@@ -1760,10 +1794,12 @@ class DorisVectorClient:
     def _get_alive_be_count(self) -> int:
         """Get the count of alive backends."""
         try:
-            with self.session.begin() as conn:
-                result = conn.execute(text("SHOW BACKENDS"))
-                rows = result.fetchall()
-                col_names = list(result.keys())
+            cursor = self.connection.cursor()
+            try:
+                cursor.execute("SHOW BACKENDS")
+                rows = cursor.fetchall()
+                # Get column names from cursor.description
+                col_names = [desc[0] for desc in cursor.description] if cursor.description else []
                 alive_idx = None
                 if col_names:
                     for i, n in enumerate(col_names):
@@ -1773,18 +1809,20 @@ class DorisVectorClient:
                 count = 0
                 if alive_idx is None:
                     # Fallback: assume all rows are backends
-                    count = len(rows)
+                    count = len(rows) if rows else 0
                 else:
                     for r in rows:
                         sval = str(r[alive_idx]).strip().lower()
                         if sval in ("true", "1", "yes", "y"):
                             count += 1
                 return max(1, count)
+            finally:
+                cursor.close()
         except Exception as e:
             logger.warning(f"SHOW BACKENDS failed, fallback to 1 bucket: {e}")
             return 1
 
     def close(self):
         """Close the client connection."""
-        self.session.close_all()
-        # self.engine = None
+        if hasattr(self, 'connection') and self.connection:
+            self.connection.close()
