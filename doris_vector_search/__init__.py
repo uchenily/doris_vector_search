@@ -778,15 +778,15 @@ class VectorSearchQuery:
         logger.debug(f"parameters: {params}")
 
         # Use mysqlconnector connection with prepared cursor for vector search
-        cursor = self.table.client.connection.cursor(buffered=False, prepared=True)
-        try:
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
-        finally:
-            cursor.close()
+        cursor = self.table._get_cursor(prepared=True)
+        cursor.execute(sql, params)
+        rows = cursor.fetchall()
 
         select_columns = self.selected_columns or all_columns
         col_data = {col: [] for col in select_columns}
+
+        # data = [list(column) for column in zip(*rows)]
+        # return pa.Table.from_arrays(data, names=columns)
 
         # TODO: optimize it
         for row in rows:
@@ -853,6 +853,8 @@ class DorisTable:
     ):
         self.table_name = name
         self.client = client
+        self._cursor: Optional[Any] = None
+        self._prepared_cursor: Optional[Any] = None
         self.columns: List[Tuple[str, str]] = (
             self._get_columns()
         )  # List of (name, type)
@@ -864,23 +866,31 @@ class DorisTable:
     def get_session(self):
         return self.client.connection
 
+    def _get_cursor(self, prepared: bool = False):
+        """Get or create a cursor, reusing if possible."""
+        if prepared:
+            if self._prepared_cursor is None:
+                self._prepared_cursor = self.client.connection.cursor(buffered=False, prepared=True)
+            return self._prepared_cursor
+        else:
+            if self._cursor is None:
+                self._cursor = self.client.connection.cursor(buffered=False, prepared=False)
+            return self._cursor
+
     def schema(self):
         return self.columns
 
     def _get_columns(self) -> List[Tuple[str, str]]:
         """Get column names and types from Doris."""
         try:
-            cursor = self.client.connection.cursor()
-            try:
-                cursor.execute(f"DESCRIBE {self.table_name}")
-                columns = []
-                for row in cursor.fetchall():
-                    col_name = str(row[0])  # Field name
-                    col_type = str(row[1])  # Type
-                    columns.append((col_name, col_type))
-                return columns
-            finally:
-                cursor.close()
+            cursor = self._get_cursor()
+            cursor.execute(f"DESCRIBE {self.table_name}")
+            columns = []
+            for row in cursor.fetchall():
+                col_name = str(row[0])  # Field name
+                col_type = str(row[1])  # Type
+                columns.append((col_name, col_type))
+            return columns
         except Exception as e:
             logger.warning(f"Failed to get columns for table {self.table_name}: {e}")
             raise e
@@ -970,24 +980,21 @@ class DorisTable:
     def _get_table_schema(self) -> Dict[str, Dict[str, Any]]:
         """Get the table schema from Doris."""
         try:
-            cursor = self.client.connection.cursor()
-            try:
-                cursor.execute(f"DESCRIBE {self.table_name}")
-                schema = {}
+            cursor = self._get_cursor()
+            cursor.execute(f"DESCRIBE {self.table_name}")
+            schema = {}
 
-                for row in cursor.fetchall():
-                    # Field | Type | Null | Key | Default | Extra
-                    col_name, col_type, is_null, key, default, extra = row
-                    schema[col_name] = {
-                        "doris_type": col_type,
-                        "nullable": is_null.upper() == "YES",
-                        "is_key": key.upper() == "YES",
-                        "default": default if default != "NULL" else None,
-                    }
+            for row in cursor.fetchall():
+                # Field | Type | Null | Key | Default | Extra
+                col_name, col_type, is_null, key, default, extra = row
+                schema[col_name] = {
+                    "doris_type": col_type,
+                    "nullable": is_null.upper() == "YES",
+                    "is_key": key.upper() == "YES",
+                    "default": default if default != "NULL" else None,
+                }
 
-                return schema
-            finally:
-                cursor.close()
+            return schema
 
         except Exception as e:
             logger.error(f"Failed to get schema for table {self.table_name}: {e}")
@@ -1136,20 +1143,17 @@ class DorisTable:
 
         try:
             # Sample a row to get vector dimension
-            cursor = self.client.connection.cursor()
-            try:
-                cursor.execute(f"SELECT `{vector_column}` FROM `{self.table_name}` LIMIT 1")
-                row = cursor.fetchone()
-                if row and row[0]:
-                    # Parse the vector string format like: [1.0,2.0,3.0]
-                    vector_str = str(row[0])
-                    if vector_str.startswith("[") and vector_str.endswith("]"):
-                        vec_list = vector_str[1:-1].split(",")
-                        # Udpate index_options.dim
-                        self.index_options.dim = len(vec_list)
-                        return self.index_options.dim
-            finally:
-                cursor.close()
+            cursor = self._get_cursor()
+            cursor.execute(f"SELECT `{vector_column}` FROM `{self.table_name}` LIMIT 1")
+            row = cursor.fetchone()
+            if row and row[0]:
+                # Parse the vector string format like: [1.0,2.0,3.0]
+                vector_str = str(row[0])
+                if vector_str.startswith("[") and vector_str.endswith("]"):
+                    vec_list = vector_str[1:-1].split(",")
+                    # Udpate index_options.dim
+                    self.index_options.dim = len(vec_list)
+                    return self.index_options.dim
         except Exception as e:
             logger.warning(f"Failed to get vector dimension: {e}")
         raise ValueError("Failed to get vector dimension")
@@ -1157,26 +1161,23 @@ class DorisTable:
     def _get_dim_from_table_metadata(self, vector_column: str) -> int:
         """Get dimension from table's CREATE TABLE statement."""
         try:
-            cursor = self.client.connection.cursor()
-            try:
-                cursor.execute(f"SHOW CREATE TABLE `{self.table_name}`")
-                row = cursor.fetchone()
-                if row:
-                    create_table_sql = row[-1]
-                    # Handle bytes to string conversion
-                    if isinstance(create_table_sql, bytes):
-                        create_table_sql = create_table_sql.decode('utf-8')
-                    # Parse the PROPERTIES in the INDEX clause
-                    # Looking for: USING ANN PROPERTIES("dim" = "xxx", ...)
-                    match = re.search(r'USING\s+ANN\s+PROPERTIES\s*\((.*?)\)', create_table_sql, re.IGNORECASE)
-                    if match:
-                        properties_str = match.group(1)
-                        # Find "dim" = "xxx"
-                        dim_match = re.search(r'"dim"\s*=\s*"(\d+)"', properties_str)
-                        if dim_match:
-                            return int(dim_match.group(1))
-            finally:
-                cursor.close()
+            cursor = self._get_cursor()
+            cursor.execute(f"SHOW CREATE TABLE `{self.table_name}`")
+            row = cursor.fetchone()
+            if row:
+                create_table_sql = row[-1]
+                # Handle bytes to string conversion
+                if isinstance(create_table_sql, bytes):
+                    create_table_sql = create_table_sql.decode('utf-8')
+                # Parse the PROPERTIES in the INDEX clause
+                # Looking for: USING ANN PROPERTIES("dim" = "xxx", ...)
+                match = re.search(r'USING\s+ANN\s+PROPERTIES\s*\((.*?)\)', create_table_sql, re.IGNORECASE)
+                if match:
+                    properties_str = match.group(1)
+                    # Find "dim" = "xxx"
+                    dim_match = re.search(r'"dim"\s*=\s*"(\d+)"', properties_str)
+                    if dim_match:
+                        return int(dim_match.group(1))
         except Exception as e:
             logger.warning(f"Failed to parse dim from CREATE TABLE: {e}")
         return -1
@@ -1206,20 +1207,15 @@ class DorisTable:
         )
 
         try:
-            cursor = self.client.connection.cursor()
-            try:
-                # Create index
-                logger.debug(f"Creating index with SQL: {create_sql}")
-                cursor.execute(create_sql)
-                self.client.connection.commit()
-                logger.debug(f"Successfully created index idx_{vector_column}")
+            cursor = self._get_cursor()
+            # Create index
+            logger.debug(f"Creating index with SQL: {create_sql}")
+            cursor.execute(create_sql)
+            logger.debug(f"Successfully created index idx_{vector_column}")
 
-                # Build index
-                cursor.execute(build_sql)
-                logger.debug(f"Building index with SQL: {build_sql}")
-                self.client.connection.commit()
-            finally:
-                cursor.close()
+            # Build index
+            logger.debug(f"Building index with SQL: {build_sql}")
+            cursor.execute(build_sql)
             logger.debug(f"Successfully built index idx_{vector_column}")
 
         except Exception as e:
@@ -1240,17 +1236,21 @@ class DorisTable:
         logger.debug(f"Dropping index with SQL: {drop_sql}")
 
         try:
-            cursor = self.client.connection.cursor()
-            try:
-                cursor.execute(drop_sql)
-                self.client.connection.commit()
-                logger.debug(f"Successfully dropped index idx_{vector_column}")
-            finally:
-                cursor.close()
+            cursor = self._get_cursor()
+            cursor.execute(drop_sql)
+            logger.debug(f"Successfully dropped index idx_{vector_column}")
 
         except Exception as e:
             logger.error(f"Failed to drop index idx_{vector_column}: {e}")
             raise
+
+    def close(self):
+        if self._cursor:
+            self._cursor.close()
+            self._cursor = None
+        if self._prepared_cursor:
+            self._prepared_cursor.close()
+            self._prepared_cursor = None
 
 
 class DorisVectorClient:
@@ -1394,7 +1394,6 @@ class DorisVectorClient:
         cursor = self.connection.cursor()
         try:
             cursor.execute(ddl)
-            self.connection.commit()
 
             # Insert data using stream load
             self._insert_data_stream_load(
@@ -1747,7 +1746,6 @@ class DorisVectorClient:
             cursor = self.connection.cursor()
             try:
                 cursor.execute(drop_sql)
-                self.connection.commit()
             finally:
                 cursor.close()
             logger.debug(f"Successfully dropped table '{table_name}'")
@@ -1769,7 +1767,6 @@ class DorisVectorClient:
         cursor = self.connection.cursor()
         try:
             cursor.execute(sql)
-            self.connection.commit()
         finally:
             cursor.close()
         logger.debug(f"Set session variable {key} = {value}")
@@ -1817,5 +1814,5 @@ class DorisVectorClient:
 
     def close(self):
         """Close the client connection."""
-        if hasattr(self, 'connection') and self.connection:
+        if self.connection:
             self.connection.close()
