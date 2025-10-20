@@ -347,6 +347,8 @@ def block_to_arrow_table(block: Block) -> pa.Table:
     # NOTE: Cast any list[double] columns to list[float32] to ensure consistency.
     # This fixes the issue where Python list[float] becomes list[double] in Arrow.
     # Any better way?
+    # NOTE: Remove those code after solving data corruption caused by inconsistency
+    # between arrow format data types and table definition types in streamload.
     new_columns = []
     for col_name in table.column_names:
         col = table.column(col_name)
@@ -357,6 +359,10 @@ def block_to_arrow_table(block: Block) -> pa.Table:
                 new_columns.append((col_name, new_col))
             else:
                 new_columns.append((col_name, col))
+        elif pa.types.is_int64(col.type):
+            # Cast int64 to int32
+            new_col = col.cast(pa.int32())
+            new_columns.append((col_name, new_col))
         else:
             new_columns.append((col_name, col))
 
