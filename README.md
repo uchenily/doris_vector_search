@@ -151,3 +151,7 @@ db.with_session("parallel_pipeline_task_num", 1)\
 db.with_sessions(
     {"parallel_pipeline_task_num": 1, "num_scanner_threads": 1, "enable_profile": False})
 ```
+
+### Thread Safety
+
+The DorisVectorClient is not thread-safe because the underlying connection object created by `mysql.connector.connect(...)` cannot be shared across multiple threads. If you need to use the SDK in a multi-threaded environment, create a separate client instance in each thread.
