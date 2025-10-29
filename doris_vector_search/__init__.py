@@ -134,7 +134,7 @@ class TableOptions:
         columns: Dict[str, str],
         key_column: str,
         vector_column: Optional[str] = None,
-        vector_options: Optional[Dict[str, Any]] = None,
+        vector_options: Optional[IndexOptions] = None,
         table_properties: Optional[Dict[str, Any]] = None,
         num_replication: int = 1,
         num_buckets: int = 1,
@@ -146,7 +146,7 @@ class TableOptions:
             columns: Dictionary mapping column names to their Doris types
             key_column: Name of the key column
             vector_column: Name of the vector column (optional)
-            vector_options: Options for vector index creation (optional)
+            vector_options: IndexOptions for vector index creation (optional)
             table_properties: Additional table properties (optional)
             num_buckets: Number of buckets for distribution (default: 1)
         """
@@ -614,12 +614,17 @@ class DorisDDLCompiler:
         # Build index clause
         index_clause = ""
         if table_options.vector_column and table_options.vector_options:
+            options = table_options.vector_options
             props = []
-            for key, value in table_options.vector_options.items():
-                if isinstance(value, str):
-                    props.append(f'"{key}"="{value}"')
-                else:
-                    props.append(f'"{key}"={value}')
+            props.append(f'"index_type"="{options.index_type}"')
+            props.append(f'"metric_type"="{options.metric_type}"')
+            props.append(f'"dim"={options.dim}')
+            if options.quantizer:
+                props.append(f'"quantizer"="{options.quantizer}"')
+            if options.pq_m is not None:
+                props.append(f'"pq_m"={options.pq_m}')
+            if options.pq_nbits is not None:
+                props.append(f'"pq_nbits"={options.pq_nbits}')
             index_clause = f""",INDEX idx_{table_options.vector_column}(`{table_options.vector_column}`) USING ANN PROPERTIES({','.join(props)})"""
 
         # Build table properties
@@ -642,19 +647,20 @@ class DorisDDLCompiler:
         self,
         table_name: str,
         vector_column: str,
-        index_options: Dict[str, Any],
-        dim: int,
+        index_options: IndexOptions,
     ) -> str:
         """Compile CREATE INDEX statement for vector index."""
         index_name = f"idx_{vector_column}"
-        # Ensure dim is in index_options
-        index_options["dim"] = dim
         props = []
-        for key, value in index_options.items():
-            if isinstance(value, str):
-                props.append(f'"{key}"="{value}"')
-            else:
-                props.append(f'"{key}"={value}')
+        props.append(f'"index_type"="{index_options.index_type}"')
+        props.append(f'"metric_type"="{index_options.metric_type}"')
+        props.append(f'"dim"={index_options.dim}')
+        if index_options.quantizer:
+            props.append(f'"quantizer"="{index_options.quantizer}"')
+        if index_options.pq_m is not None:
+            props.append(f'"pq_m"={index_options.pq_m}')
+        if index_options.pq_nbits is not None:
+            props.append(f'"pq_nbits"={index_options.pq_nbits}')
         sql = f"""CREATE INDEX {index_name} ON {table_name}(`{vector_column}`) USING ANN PROPERTIES({','.join(props)})"""
         return sql
 
@@ -1242,19 +1248,11 @@ class DorisTable:
         vector_column = self._detect_vector_column()
         dim = self._get_vector_dim(vector_column)
 
-        index_options_dict = {
-            "index_type": options.index_type,
-            "metric_type": options.metric_type,
-        }
-        if options.quantizer:
-            index_options_dict["quantizer"] = options.quantizer
-        if options.pq_m is not None:
-            index_options_dict["pq_m"] = options.pq_m
-        if options.pq_nbits is not None:
-            index_options_dict["pq_nbits"] = options.pq_nbits
+        if options.dim == -1:
+            options.dim = dim
 
         create_sql = self.ddl_compiler.compile_create_index(
-            self.table_name, vector_column, index_options_dict, dim
+            self.table_name, vector_column, options
         )
         build_sql = self.ddl_compiler.compile_build_index(
             self.table_name, vector_column
@@ -1417,19 +1415,11 @@ class DorisVectorClient:
         vector_options = None
         if create_index:
             if index_options is None:
-                index_options = IndexOptions()
-
-            vector_options = {
-                "index_type": index_options.index_type,
-                "metric_type": index_options.metric_type,
-                "dim": schema_info.vector_dim,
-            }
-            if index_options.quantizer:
-                vector_options["quantizer"] = index_options.quantizer
-            if index_options.pq_m is not None:
-                vector_options["pq_m"] = index_options.pq_m
-            if index_options.pq_nbits is not None:
-                vector_options["pq_nbits"] = index_options.pq_nbits
+                index_options = IndexOptions(dim=schema_info.vector_dim)
+            else:
+                if index_options.dim == -1:
+                    index_options.dim = schema_info.vector_dim
+            vector_options = index_options
 
         # Determine buckets by counting alive backends
         num_buckets = self._get_alive_be_count()
