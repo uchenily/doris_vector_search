@@ -29,16 +29,26 @@ class IndexOptions:
         index_type: str = "hnsw",
         metric_type: str = "l2_distance",
         dim: int = -1,
+        quantizer: Optional[str] = None,
+        pq_m: Optional[int] = None,
+        pq_nbits: Optional[int] = None,
     ):
         """Index options.
 
         Args:
             index_type: Type of vector index (currently only 'hnsw' is supported)
             metric_type: Distance metric ('l2_distance' or 'inner_product')
+            dim: Dimension of the vector
+            quantizer: Quantizer type ('pq' for product quantization, 'sq4/sq8' for scalar quantization)
+            pq_m: Number of sub-quantizers for PQ (required if quantizer='pq')
+            pq_nbits: Number of bits per sub-quantizer for PQ (required if quantizer='pq')
         """
         self.index_type = index_type.lower()
         self.metric_type = metric_type.lower()
         self.dim = dim
+        self.quantizer = quantizer.lower() if quantizer else None
+        self.pq_m = pq_m
+        self.pq_nbits = pq_nbits
 
         self._validate()
 
@@ -46,6 +56,7 @@ class IndexOptions:
         """Validate index options."""
         supported_index_types = ["hnsw"]
         supported_distance_types = ["l2_distance", "inner_product"]
+        supported_quantizers = ["pq", "sq4", "sq8"]
 
         if self.index_type not in supported_index_types:
             raise ValueError(
@@ -56,6 +67,23 @@ class IndexOptions:
             raise ValueError(
                 f"Unsupported metric_type: {self.metric_type}. Supported: {supported_distance_types}"
             )
+
+        if self.quantizer and self.quantizer not in supported_quantizers:
+            raise ValueError(
+                f"Unsupported quantizer: {self.quantizer}. Supported: {supported_quantizers}"
+            )
+
+        if self.quantizer == "pq":
+            if self.pq_m is None or self.pq_nbits is None:
+                raise ValueError("pq_m and pq_nbits are required when quantizer='pq'")
+            if self.pq_m <= 0 or self.pq_nbits <= 0:
+                raise ValueError("pq_m and pq_nbits must be positive integers")
+        elif self.quantizer == "sq8":
+            if self.pq_m is not None or self.pq_nbits is not None:
+                raise ValueError("pq_m and pq_nbits should not be set when quantizer='sq8'")
+        else:
+            if self.pq_m is not None or self.pq_nbits is not None:
+                raise ValueError("pq_m and pq_nbits should only be set when quantizer='pq'")
 
 
 class AuthOptions:
@@ -586,7 +614,13 @@ class DorisDDLCompiler:
         # Build index clause
         index_clause = ""
         if table_options.vector_column and table_options.vector_options:
-            index_clause = f""",INDEX idx_{table_options.vector_column}(`{table_options.vector_column}`) USING ANN PROPERTIES("index_type"="{table_options.vector_options['index_type']}","metric_type"="{table_options.vector_options['metric_type']}","dim"={table_options.vector_options['dim']})"""
+            props = []
+            for key, value in table_options.vector_options.items():
+                if isinstance(value, str):
+                    props.append(f'"{key}"="{value}"')
+                else:
+                    props.append(f'"{key}"={value}')
+            index_clause = f""",INDEX idx_{table_options.vector_column}(`{table_options.vector_column}`) USING ANN PROPERTIES({','.join(props)})"""
 
         # Build table properties
         properties_clause = ""
@@ -613,7 +647,15 @@ class DorisDDLCompiler:
     ) -> str:
         """Compile CREATE INDEX statement for vector index."""
         index_name = f"idx_{vector_column}"
-        sql = f"""CREATE INDEX {index_name} ON {table_name}(`{vector_column}`) USING ANN PROPERTIES("index_type"="{index_options["index_type"]}","metric_type"="{index_options["metric_type"]}","dim"="{dim}")"""
+        # Ensure dim is in index_options
+        index_options["dim"] = dim
+        props = []
+        for key, value in index_options.items():
+            if isinstance(value, str):
+                props.append(f'"{key}"="{value}"')
+            else:
+                props.append(f'"{key}"={value}')
+        sql = f"""CREATE INDEX {index_name} ON {table_name}(`{vector_column}`) USING ANN PROPERTIES({','.join(props)})"""
         return sql
 
     def compile_build_index(self, table_name: str, vector_column: str) -> str:
@@ -1204,6 +1246,12 @@ class DorisTable:
             "index_type": options.index_type,
             "metric_type": options.metric_type,
         }
+        if options.quantizer:
+            index_options_dict["quantizer"] = options.quantizer
+        if options.pq_m is not None:
+            index_options_dict["pq_m"] = options.pq_m
+        if options.pq_nbits is not None:
+            index_options_dict["pq_nbits"] = options.pq_nbits
 
         create_sql = self.ddl_compiler.compile_create_index(
             self.table_name, vector_column, index_options_dict, dim
@@ -1376,6 +1424,12 @@ class DorisVectorClient:
                 "metric_type": index_options.metric_type,
                 "dim": schema_info.vector_dim,
             }
+            if index_options.quantizer:
+                vector_options["quantizer"] = index_options.quantizer
+            if index_options.pq_m is not None:
+                vector_options["pq_m"] = index_options.pq_m
+            if index_options.pq_nbits is not None:
+                vector_options["pq_nbits"] = index_options.pq_nbits
 
         # Determine buckets by counting alive backends
         num_buckets = self._get_alive_be_count()
