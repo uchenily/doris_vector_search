@@ -1345,6 +1345,7 @@ class DorisVectorClient:
         index_options: Optional[IndexOptions] = None,
         load_options: Optional[LoadOptions] = None,
         overwrite: bool = False,
+        insert_data: bool = True,
     ) -> DorisTable:
         """Create a new table from various data formats with dynamic schema inference.
 
@@ -1360,6 +1361,7 @@ class DorisVectorClient:
             index_options: Configuration options for the vector index (default: None, uses defaults)
             load_options: Options for data loading (default: None, uses arrow format)
             overwrite: Whether to drop the table if it already exists (default: False)
+            insert_data: Whether to insert the provided data into the table (default: True)
         """
         # Set default load options if not provided
         if not load_options:
@@ -1445,10 +1447,11 @@ class DorisVectorClient:
         try:
             cursor.execute(ddl)
 
-            # Insert data using stream load
-            self._insert_data_stream_load(
-                table_name, arrow_table, schema_info, load_options
-            )
+            if insert_data:
+                # Insert data using stream load
+                self._insert_data_stream_load(
+                    table_name, arrow_table, schema_info, load_options
+                )
         finally:
             cursor.close()
 
