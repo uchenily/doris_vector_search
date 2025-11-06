@@ -144,12 +144,11 @@ db = DorisVectorClient(database="test")
 
 # Set session variables
 db.with_session("parallel_pipeline_task_num", 1)\
-  .with_session("num_scanner_threads", 1)\
   .with_session("enable_profile", False)
 
 # or
 db.with_sessions(
-    {"parallel_pipeline_task_num": 1, "num_scanner_threads": 1, "enable_profile": False})
+    {"parallel_pipeline_task_num": 1, "enable_profile": False})
 ```
 
 ### Thread Safety
