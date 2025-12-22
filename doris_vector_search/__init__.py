@@ -1573,13 +1573,18 @@ class DorisVectorClient:
             elif isinstance(sample_value, float):
                 columns[col_name] = {"doris_type": "FLOAT"}
             elif isinstance(sample_value, str):
-                columns[col_name] = {"doris_type": "TEXT"}  # VARCHAR?
+                columns[col_name] = {"doris_type": "TEXT"}
+                # TEXT column cannot be used as a primary key column
+                if col_name == key_column:
+                    columns[col_name]["doris_type"] = "VARCHAR(64)"
             else:
                 # Default to TEXT for unknown types
                 logger.warning(
                     f"Unknown type for column '{col_name}': {type(sample_value)}, defaulting to TEXT"
                 )
                 columns[col_name] = {"doris_type": "TEXT"}
+                if col_name == key_column:
+                    columns[col_name]["doris_type"] = "VARCHAR(64)"
 
         return TableSchema(
             columns=columns,
