@@ -6,7 +6,7 @@ import logging
 import math
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Optional, Self, Tuple, Union, Literal
+from typing import Any, Dict, Iterable, List, Optional, Self, Tuple, Union
 
 import pandas as pd
 import pyarrow as pa
@@ -26,7 +26,7 @@ class IndexOptions:
 
     def __init__(
         self,
-        index_type: Literal["hnsw", "ivf"] = "hnsw",
+        index_type: str = "hnsw",
         metric_type: str = "l2_distance",
         dim: int = -1,
         quantizer: Optional[str] = None,
@@ -35,19 +35,21 @@ class IndexOptions:
         max_degree: int = 32,
         ef_construction: int = 40,
         nlist: int = 1024,
+        ann_properties: Optional[Dict[str, Union[str, int, float, bool]]] = None,
     ):
         """Index options.
 
         Args:
-            index_type: Type of vector index (currently only 'hnsw' is supported)
-            metric_type: Distance metric ('l2_distance' or 'inner_product')
+            index_type: Type of vector index (passed through to Doris as-is)
+            metric_type: Distance metric (passed through to Doris as-is)
             dim: Dimension of the vector
-            quantizer: Quantizer type ('pq' for product quantization, 'sq4'/'sq8' for scalar quantization, 'flat' for no quantization)
-            pq_m: Number of sub-quantizers for PQ (required if quantizer='pq')
-            pq_nbits: Number of bits per sub-quantizer for PQ (required if quantizer='pq')
+            quantizer: Quantizer type (passed through to Doris as-is)
+            pq_m: Number of sub-quantizers for PQ
+            pq_nbits: Number of bits per sub-quantizer for PQ
             max_degree: Maximum degree for HNSW index (default: 32)
             ef_construction: Size of the dynamic candidate list for HNSW index construction (default: 40)
             nlist: Number of cluster units for IVF index construction (default: 1024)
+            ann_properties: Extra ANN properties to pass through to Doris PROPERTIES(...)
         """
         self.index_type = index_type.lower()
         self.metric_type = metric_type.lower()
@@ -58,53 +60,49 @@ class IndexOptions:
         self.max_degree = max_degree
         self.ef_construction = ef_construction
         self.nlist = nlist
+        self.ann_properties = ann_properties.copy() if ann_properties else {}
 
         self._validate()
 
     def _validate(self):
-        """Validate index options."""
-        supported_index_types = ["hnsw", "ivf"]
-        supported_distance_types = ["l2_distance", "inner_product"]
-        supported_quantizers = ["pq", "sq4", "sq8", "flat"]
+        """Validate index options with passthrough behavior."""
+        if not isinstance(self.ann_properties, dict):
+            raise ValueError("ann_properties must be a dictionary")
 
-        if self.index_type not in supported_index_types:
-            raise ValueError(
-                f"Unsupported index_type: {self.index_type}. Currently only {supported_index_types} are supported."
-            )
+    def to_ann_properties(self) -> List[str]:
+        """Build Doris ANN property key-value pairs."""
+        props: Dict[str, Union[str, int, float, bool]] = {
+            "index_type": self.index_type,
+            "metric_type": self.metric_type,
+            "dim": self.dim,
+        }
 
-        if self.metric_type not in supported_distance_types:
-            raise ValueError(
-                f"Unsupported metric_type: {self.metric_type}. Supported: {supported_distance_types}"
-            )
+        # Keep current behavior for known index types.
+        if self.index_type == "hnsw":
+            props["max_degree"] = self.max_degree
+            props["ef_construction"] = self.ef_construction
+        elif self.index_type == "ivf":
+            props["nlist"] = self.nlist
 
-        if self.quantizer and self.quantizer not in supported_quantizers:
-            raise ValueError(
-                f"Unsupported quantizer: {self.quantizer}. Supported: {supported_quantizers}"
-            )
+        if self.quantizer:
+            props["quantizer"] = self.quantizer
+        if self.pq_m is not None:
+            props["pq_m"] = self.pq_m
+        if self.pq_nbits is not None:
+            props["pq_nbits"] = self.pq_nbits
 
-        if self.max_degree <= 0:
-            raise ValueError("max_degree must be positive")
+        # Caller-provided properties have highest priority.
+        props.update(self.ann_properties)
 
-        if self.ef_construction <= 0:
-            raise ValueError("ef_construction must be positive")
-
-        if self.nlist <= 0:
-            raise ValueError("nlist must be positive")
-
-        if self.quantizer == "pq":
-            if self.pq_m is None or self.pq_nbits is None:
-                raise ValueError("pq_m and pq_nbits are required when quantizer='pq'")
-            if self.pq_m <= 0 or self.pq_nbits <= 0:
-                raise ValueError("pq_m and pq_nbits must be positive integers")
-        elif self.quantizer == "sq8":
-            if self.pq_m is not None or self.pq_nbits is not None:
-                raise ValueError("pq_m and pq_nbits should not be set when quantizer='sq8'")
-        elif self.quantizer == "flat":
-            if self.pq_m is not None or self.pq_nbits is not None:
-                raise ValueError("pq_m and pq_nbits should not be set when quantizer='flat'")
-        else:
-            if self.pq_m is not None or self.pq_nbits is not None:
-                raise ValueError("pq_m and pq_nbits should only be set when quantizer='pq'")
+        formatted_props: List[str] = []
+        for key, value in props.items():
+            if isinstance(value, str):
+                formatted_props.append(f'"{key}"="{value}"')
+            elif isinstance(value, bool):
+                formatted_props.append(f'"{key}"={"true" if value else "false"}')
+            else:
+                formatted_props.append(f'"{key}"={value}')
+        return formatted_props
 
 
 class AuthOptions:
@@ -578,24 +576,7 @@ class DorisDDLCompiler:
         index_clause = ""
         if table_options.vector_column and table_options.vector_options:
             options = table_options.vector_options
-            props = []
-            props.append(f'"index_type"="{options.index_type}"')
-            props.append(f'"metric_type"="{options.metric_type}"')
-            props.append(f'"dim"={options.dim}')
-            if options.index_type == "hnsw":
-                props.append(f'"max_degree"={options.max_degree}')
-                props.append(f'"ef_construction"={options.ef_construction}')
-            elif options.index_type == "ivf":
-                props.append(f'"nlist"={options.nlist}')
-            else:
-                raise ValueError(f"unknown index_type: {options.index_type}")
-
-            if options.quantizer:
-                props.append(f'"quantizer"="{options.quantizer}"')
-            if options.pq_m is not None:
-                props.append(f'"pq_m"={options.pq_m}')
-            if options.pq_nbits is not None:
-                props.append(f'"pq_nbits"={options.pq_nbits}')
+            props = options.to_ann_properties()
             index_clause = f""",INDEX idx_{table_options.vector_column}(`{table_options.vector_column}`) USING ANN PROPERTIES({','.join(props)})"""
 
         # Build table properties
@@ -622,23 +603,7 @@ class DorisDDLCompiler:
     ) -> str:
         """Compile CREATE INDEX statement for vector index."""
         index_name = f"idx_{vector_column}"
-        props = []
-        props.append(f'"index_type"="{index_options.index_type}"')
-        props.append(f'"metric_type"="{index_options.metric_type}"')
-        props.append(f'"dim"={index_options.dim}')
-        if index_options.index_type == "hnsw":
-            props.append(f'"max_degree"={index_options.max_degree}')
-            props.append(f'"ef_construction"={index_options.ef_construction}')
-        elif index_options.index_type == "ivf":
-            props.append(f'"nlist"={index_options.nlist}')
-        else:
-            raise ValueError(f"unknown index type: {index_options.index_type}")
-        if index_options.quantizer:
-            props.append(f'"quantizer"="{index_options.quantizer}"')
-        if index_options.pq_m is not None:
-            props.append(f'"pq_m"={index_options.pq_m}')
-        if index_options.pq_nbits is not None:
-            props.append(f'"pq_nbits"={index_options.pq_nbits}')
+        props = index_options.to_ann_properties()
         sql = f"""CREATE INDEX {index_name} ON {table_name}(`{vector_column}`) USING ANN PROPERTIES({','.join(props)})"""
         return sql
 
