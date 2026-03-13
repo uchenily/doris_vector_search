@@ -6,7 +6,7 @@ import logging
 import math
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Optional, Self, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Self, Tuple, Union, Literal
 
 import pandas as pd
 import pyarrow as pa
@@ -26,7 +26,7 @@ class IndexOptions:
 
     def __init__(
         self,
-        index_type: str = "hnsw",
+        index_type: Literal["hnsw", "ivf"] = "hnsw",
         metric_type: str = "l2_distance",
         dim: int = -1,
         quantizer: Optional[str] = None,
@@ -34,6 +34,7 @@ class IndexOptions:
         pq_nbits: Optional[int] = None,
         max_degree: int = 32,
         ef_construction: int = 40,
+        nlist: int = 1024,
     ):
         """Index options.
 
@@ -46,6 +47,7 @@ class IndexOptions:
             pq_nbits: Number of bits per sub-quantizer for PQ (required if quantizer='pq')
             max_degree: Maximum degree for HNSW index (default: 32)
             ef_construction: Size of the dynamic candidate list for HNSW index construction (default: 40)
+            nlist: Number of cluster units for IVF index construction (default: 1024)
         """
         self.index_type = index_type.lower()
         self.metric_type = metric_type.lower()
@@ -55,12 +57,13 @@ class IndexOptions:
         self.pq_nbits = pq_nbits
         self.max_degree = max_degree
         self.ef_construction = ef_construction
+        self.nlist = nlist
 
         self._validate()
 
     def _validate(self):
         """Validate index options."""
-        supported_index_types = ["hnsw"]
+        supported_index_types = ["hnsw", "ivf"]
         supported_distance_types = ["l2_distance", "inner_product"]
         supported_quantizers = ["pq", "sq4", "sq8", "flat"]
 
@@ -84,6 +87,9 @@ class IndexOptions:
 
         if self.ef_construction <= 0:
             raise ValueError("ef_construction must be positive")
+
+        if self.nlist <= 0:
+            raise ValueError("nlist must be positive")
 
         if self.quantizer == "pq":
             if self.pq_m is None or self.pq_nbits is None:
@@ -420,69 +426,6 @@ def block_to_arrow_table(block: Block) -> pa.Table:
 class DorisSQLCompiler:
     """Doris-specific SQL compiler for vector search queries."""
 
-    def compile_vector_search_query(
-        self,
-        table_name: str,
-        query_vector: List[float],
-        vector_column: str,
-        limit: Optional[int] = None,
-        distance_range: Optional[Tuple[Optional[float], Optional[float]]] = None,
-        where_conditions: Optional[List[str]] = None,
-        selected_columns: Optional[List[str]] = None,
-        metric_type: str = "l2_distance",
-    ) -> str:
-        """Compile vector search query to Doris SQL."""
-        vector_str = f"[{','.join(map(str, query_vector))}]"
-
-        # Determine which columns to select
-        if selected_columns:
-            select_columns = selected_columns
-        else:
-            # Default: select all columns
-            select_columns = ["*"]
-
-        # Build SELECT clause
-        select_clause = ", ".join(f"`{col}`" for col in select_columns)
-
-        distance_fn = f"{metric_type}_approximate"
-
-        # Build WHERE clause
-        where_parts = []
-
-        # Add distance range conditions
-        if distance_range:
-            lower_bound, upper_bound = distance_range
-            if lower_bound is not None:
-                where_parts.append(
-                    f"{distance_fn}(`{vector_column}`, {vector_str}) >= {lower_bound}"
-                )
-            if upper_bound is not None:
-                where_parts.append(
-                    f"{distance_fn}(`{vector_column}`, {vector_str}) <= {upper_bound}"
-                )
-
-        # Add user-defined WHERE conditions
-        if where_conditions:
-            where_parts.extend(where_conditions)
-
-        where_clause = ""
-        if where_parts:
-            where_clause = f"WHERE {' AND '.join(where_parts)}"
-
-        # Build ORDER BY
-        if metric_type == "inner_product":
-            order_clause = f"ORDER BY {distance_fn}(`{vector_column}`, {vector_str}) DESC"
-        else:
-            order_clause = f"ORDER BY {distance_fn}(`{vector_column}`, {vector_str}) ASC"
-
-        # Build LIMIT
-        limit_clause = f"LIMIT {limit}" if limit else ""
-
-        # Construct full SQL
-        sql = f"SELECT {select_clause} FROM `{table_name}` {where_clause} {order_clause} {limit_clause}"
-
-        return sql
-
     def compile_vector_search_query_prepared(
         self,
         table_name: str,
@@ -493,6 +436,7 @@ class DorisSQLCompiler:
         where_conditions: Optional[List[str]] = None,
         selected_columns: Optional[List[str]] = None,
         metric_type: str = "l2_distance",
+        include_distance: bool = False,
     ) -> Tuple[str, List[Any]]:
         """Compile vector search query to Doris SQL with prepared statement.
 
@@ -506,13 +450,17 @@ class DorisSQLCompiler:
 
         # Determine which columns to select
         if selected_columns:
-            select_columns = selected_columns
+            select_columns = selected_columns.copy()
         else:
             # Default: select all columns
             select_columns = ["*"]
 
         # Build SELECT clause
-        select_clause = ", ".join(f"`{col}`" for col in select_columns)
+        if include_distance:
+            distance_fn = f"{metric_type}_approximate"
+            select_columns.append(f"{distance_fn}(`{vector_column}`, CAST(? AS ARRAY<FLOAT>)) AS distance")
+            params.append(vector_value)
+        select_clause = ", ".join(select_columns)
 
         distance_fn = f"{metric_type}_approximate"
 
@@ -634,8 +582,14 @@ class DorisDDLCompiler:
             props.append(f'"index_type"="{options.index_type}"')
             props.append(f'"metric_type"="{options.metric_type}"')
             props.append(f'"dim"={options.dim}')
-            props.append(f'"max_degree"={options.max_degree}')
-            props.append(f'"ef_construction"={options.ef_construction}')
+            if options.index_type == "hnsw":
+                props.append(f'"max_degree"={options.max_degree}')
+                props.append(f'"ef_construction"={options.ef_construction}')
+            elif options.index_type == "ivf":
+                props.append(f'"nlist"={options.nlist}')
+            else:
+                raise ValueError(f"unknown index_type: {options.index_type}")
+
             if options.quantizer:
                 props.append(f'"quantizer"="{options.quantizer}"')
             if options.pq_m is not None:
@@ -672,8 +626,13 @@ class DorisDDLCompiler:
         props.append(f'"index_type"="{index_options.index_type}"')
         props.append(f'"metric_type"="{index_options.metric_type}"')
         props.append(f'"dim"={index_options.dim}')
-        props.append(f'"max_degree"={index_options.max_degree}')
-        props.append(f'"ef_construction"={index_options.ef_construction}')
+        if index_options.index_type == "hnsw":
+            props.append(f'"max_degree"={index_options.max_degree}')
+            props.append(f'"ef_construction"={index_options.ef_construction}')
+        elif index_options.index_type == "ivf":
+            props.append(f'"nlist"={index_options.nlist}')
+        else:
+            raise ValueError(f"unknown index type: {index_options.index_type}")
         if index_options.quantizer:
             props.append(f'"quantizer"="{index_options.quantizer}"')
         if index_options.pq_m is not None:
@@ -710,11 +669,13 @@ class VectorSearchQuery:
         query_vector: List[float],
         vector_column: str,
         metric_type: str = "l2_distance",
+        include_distance: bool = False,
     ):
         self.table = table
         self.query_vector = query_vector
         self.vector_column = vector_column
         self.metric_type = metric_type
+        self.include_distance = include_distance
         self.limit_value: Optional[int] = None
         self.distance_range_upper: Optional[float] = None
         self.distance_range_lower: Optional[float] = None
@@ -845,6 +806,7 @@ class VectorSearchQuery:
             where_conditions=self.where_conditions if self.where_conditions else None,
             selected_columns=select_columns,
             metric_type=self.metric_type,
+            include_distance=self.include_distance,
         )
 
         logger.debug(f'generated sql: "{sql}"')
@@ -856,6 +818,8 @@ class VectorSearchQuery:
         rows = cursor.fetchall()
 
         select_columns = self.selected_columns or all_columns
+        if self.include_distance:
+            select_columns = select_columns + ["distance"]
         col_data = {col: [] for col in select_columns}
 
         # data = [list(column) for column in zip(*rows)]
@@ -973,6 +937,7 @@ class DorisTable:
         query_vector: List[float],
         vector_column: Optional[str] = None,
         metric_type: str = "l2_distance",
+        include_distance: bool = False,
     ) -> VectorSearchQuery:
         """Perform vector search."""
         if vector_column is None:
@@ -984,7 +949,7 @@ class DorisTable:
                 f"Invalid query vector length: vector column dim={self._get_vector_dim(vector_column)}, but query vector length={len(query_vector)}"
             )
 
-        return VectorSearchQuery(self, query_vector, vector_column, metric_type)
+        return VectorSearchQuery(self, query_vector, vector_column, metric_type, include_distance)
 
     def add(self, block: Block, load_options: Optional[LoadOptions] = None):
         """Add data to the table.
@@ -1354,6 +1319,7 @@ class DorisVectorClient:
             "enable_profile": "false",
             "parallel_pipeline_task_num": "1",
             "hnsw_ef_search": "32",
+            "ivf_nprobe": "32",
         })
 
     def create_table(
@@ -1365,6 +1331,7 @@ class DorisVectorClient:
         load_options: Optional[LoadOptions] = None,
         overwrite: bool = False,
         insert_data: bool = True,
+        num_buckets: Optional[int] = None,
     ) -> DorisTable:
         """Create a new table from various data formats with dynamic schema inference.
 
@@ -1381,6 +1348,7 @@ class DorisVectorClient:
             load_options: Options for data loading (default: None, uses arrow format)
             overwrite: Whether to drop the table if it already exists (default: False)
             insert_data: Whether to insert the provided data into the table (default: True)
+            num_buckets: Number of buckets for distribution (default: None, None means auto-detects from alive backends)
         """
         # Set default load options if not provided
         if not load_options:
@@ -1442,16 +1410,17 @@ class DorisVectorClient:
                     index_options.dim = schema_info.vector_dim
             vector_options = index_options
 
-        # Determine buckets by counting alive backends
-        num_buckets = self._get_alive_be_count()
-        logger.debug(f"Using {num_buckets} BUCKETS according to alive backends")
+        # Determine buckets by counting alive backends or user-specified value
+        if num_buckets is None:
+            num_buckets = self._get_alive_be_count()
+            logger.debug(f"Using {num_buckets} BUCKETS according to alive backends")
 
         # Create TableOptions object
         table_options = TableOptions(
             table_name=table_name,
             columns=columns,
             key_column=key_column,
-            vector_column=vector_column if create_index else None,
+            vector_column=vector_column,
             vector_options=vector_options,
             num_buckets=num_buckets,
         )
@@ -1604,13 +1573,18 @@ class DorisVectorClient:
             elif isinstance(sample_value, float):
                 columns[col_name] = {"doris_type": "FLOAT"}
             elif isinstance(sample_value, str):
-                columns[col_name] = {"doris_type": "TEXT"}  # VARCHAR?
+                columns[col_name] = {"doris_type": "TEXT"}
+                # TEXT column cannot be used as a primary key column
+                if col_name == key_column:
+                    columns[col_name]["doris_type"] = "VARCHAR(64)"
             else:
                 # Default to TEXT for unknown types
                 logger.warning(
                     f"Unknown type for column '{col_name}': {type(sample_value)}, defaulting to TEXT"
                 )
                 columns[col_name] = {"doris_type": "TEXT"}
+                if col_name == key_column:
+                    columns[col_name]["doris_type"] = "VARCHAR(64)"
 
         return TableSchema(
             columns=columns,
