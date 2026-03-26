@@ -22,76 +22,56 @@ logger = logging.getLogger(__name__)
 
 # Configuration Options
 class IndexOptions:
-    """Configuration options for vector index creation."""
+    """Configuration options for vector index creation.
+
+    Only ``index_type``, ``metric_type`` and ``dim`` are kept as named
+    parameters because they are structurally required by the Doris ANN
+    ``PROPERTIES(...)`` syntax.  Every other index-engine parameter
+    (``max_degree``, ``ef_construction``, ``nlist``, ``quantizer``, …)
+    should be passed through the generic ``ann_properties`` dict so that:
+
+    1. The SDK never shadows Doris kernel defaults.
+    2. New index types added to Doris work immediately without SDK changes.
+    """
 
     def __init__(
         self,
         index_type: str = "hnsw",
         metric_type: str = "l2_distance",
         dim: int = -1,
-        quantizer: Optional[str] = None,
-        pq_m: Optional[int] = None,
-        pq_nbits: Optional[int] = None,
-        max_degree: int = 32,
-        ef_construction: int = 40,
-        nlist: int = 1024,
         ann_properties: Optional[Dict[str, Union[str, int, float, bool]]] = None,
     ):
         """Index options.
 
         Args:
-            index_type: Type of vector index (passed through to Doris as-is)
-            metric_type: Distance metric (passed through to Doris as-is)
-            dim: Dimension of the vector
-            quantizer: Quantizer type (passed through to Doris as-is)
-            pq_m: Number of sub-quantizers for PQ
-            pq_nbits: Number of bits per sub-quantizer for PQ
-            max_degree: Maximum degree for HNSW index (default: 32)
-            ef_construction: Size of the dynamic candidate list for HNSW index construction (default: 40)
-            nlist: Number of cluster units for IVF index construction (default: 1024)
-            ann_properties: Extra ANN properties to pass through to Doris PROPERTIES(...)
+            index_type: Type of vector index (passed through to Doris as-is).
+            metric_type: Distance metric (passed through to Doris as-is).
+            dim: Dimension of the vector.
+            ann_properties: All other ANN index properties to pass through
+                to Doris ``PROPERTIES(...)`` as-is.  The SDK will NOT
+                validate or supply defaults for these – the Doris kernel
+                is responsible for validation and default values.
         """
         self.index_type = index_type.lower()
         self.metric_type = metric_type.lower()
         self.dim = dim
-        self.quantizer = quantizer.lower() if quantizer else None
-        self.pq_m = pq_m
-        self.pq_nbits = pq_nbits
-        self.max_degree = max_degree
-        self.ef_construction = ef_construction
-        self.nlist = nlist
         self.ann_properties = ann_properties.copy() if ann_properties else {}
 
-        self._validate()
-
-    def _validate(self):
-        """Validate index options with passthrough behavior."""
-        if not isinstance(self.ann_properties, dict):
-            raise ValueError("ann_properties must be a dictionary")
-
     def to_ann_properties(self) -> List[str]:
-        """Build Doris ANN property key-value pairs."""
+        """Build Doris ANN property key-value pairs.
+
+        Only ``index_type``, ``metric_type`` and ``dim`` are always emitted.
+        Everything else comes from the caller-supplied ``ann_properties``
+        dict and is forwarded to Doris without any SDK-side filtering.
+        """
         props: Dict[str, Union[str, int, float, bool]] = {
             "index_type": self.index_type,
             "metric_type": self.metric_type,
             "dim": self.dim,
         }
 
-        # Keep current behavior for known index types.
-        if self.index_type == "hnsw":
-            props["max_degree"] = self.max_degree
-            props["ef_construction"] = self.ef_construction
-        elif self.index_type == "ivf":
-            props["nlist"] = self.nlist
-
-        if self.quantizer:
-            props["quantizer"] = self.quantizer
-        if self.pq_m is not None:
-            props["pq_m"] = self.pq_m
-        if self.pq_nbits is not None:
-            props["pq_nbits"] = self.pq_nbits
-
-        # Caller-provided properties have highest priority.
+        # Caller-provided properties have highest priority and are passed
+        # through verbatim – no SDK-side validation or defaults.
         props.update(self.ann_properties)
 
         formatted_props: List[str] = []
