@@ -133,6 +133,18 @@ table.add_index(index_options)
 
 # Drop index
 table.drop_index()
+
+# Pass through custom ANN properties to Doris kernel
+custom_index_options = IndexOptions(
+    index_type="new_kernel_algo",
+    metric_type="cosine_distance",
+    dim=64,
+    ann_properties={
+        "custom_param_a": 128,
+        "custom_param_b": "fast_mode",
+    },
+)
+table.add_index(custom_index_options)
 ```
 
 ### Setting Session Variables
